@@ -1,0 +1,823 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Snake with Better Gravity & Correct Explosions</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      background: #222;
+      overflow: hidden;
+    }
+    canvas {
+      display: block;
+    }
+  </style>
+</head>
+<body>
+<canvas id="gameCanvas"></canvas>
+
+<script>
+(function() {
+  // ----------------------------
+  // CANVAS SETUP (FULL SCREEN)
+  // ----------------------------
+  const canvas = document.getElementById('gameCanvas');
+  const ctx = canvas.getContext('2d');
+
+  function resizeCanvas() {
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+  }
+  window.addEventListener('resize', resizeCanvas);
+  resizeCanvas();
+
+  // Keep track of time
+  let lastTime = performance.now();
+
+  // ----------------------------
+  // MAP & CENTER SQUARE
+  // ----------------------------
+  const mapWidth  = 1200;
+  const mapHeight = 1200;
+  const centerX   = mapWidth / 2;
+  const centerY   = mapHeight / 2;
+
+  // Score on center square
+  let score = 0;
+  let pulse = 0;
+  const baseSquareSize = 40;
+  // ----------------------------
+  // "GHOST" SNAKE
+  // ----------------------------
+  let ghostSnake = null; // { segments: [{x,y}...], count }
+  const ghostColor = 'rgba(255,255,255,0.5)';
+  // ----------------------------
+  // SNAKE SETUP
+  // ----------------------------
+
+  let segmentCount = 12;
+  const segmentSpacing = 8;     // spacing for the tail
+  const maxPathLength  = 3000;  // store more positions
+  const path = [];              // stores all head positions for tail rendering
+
+  // Base speeds
+  const baseSpeed = 1.4;
+  const boostMultiplier = 1.3; 
+  const slowMultiplier  = 0.7;
+
+  // Turn speed: smaller snake turns faster, bigger snake turns slower
+  const baseTurnSpeed = 0.02;
+
+  // “Front” & “Back” segments each have stamina.
+  //   - Index 0 = “front segment” (slowed by Down key).
+  //   - Index segmentCount-1 = “back segment” (boosted by Up key).
+  // Each has stamina in [0..1].
+  // **We changed the drain rate so it lasts ~2 seconds** from full→empty.
+  const segmentStaminas = Array(segmentCount).fill(1.0);
+
+  // We want from 1→0 in 2s => drain = 0.5 per second
+  const STAMINA_DRAIN_PER_SEC = 0.5;    
+  // Recharge rate (unchanged or tweak as desired)
+  const STAMINA_RECHARGE_PER_SEC = 0.2; 
+
+  // Explosions
+  const explosions = [];
+  const EXPLOSION_DURATION = 0.3;
+
+  // Snake color can vary
+  let snakeColor = '#0c4010'; // default dark green
+
+  // Snake’s position & angle
+  const snake = {
+    x: centerX,
+    y: centerY - 200,
+    angle: 0
+  };
+
+  // ----------------------------
+  // INPUT
+  // ----------------------------
+  let leftPressed  = false;
+  let rightPressed = false;
+  let upPressed    = false; // boost from “back”
+  let downPressed  = false; // slow from “front”
+
+  window.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowLeft')  leftPressed  = true;
+    if (e.key === 'ArrowRight') rightPressed = true;
+    if (e.key === 'ArrowUp')    upPressed    = true;
+    if (e.key === 'ArrowDown')  downPressed  = true;
+    if (e.code === 'Space')     handleSpacePress();
+  });
+  window.addEventListener('keyup', (e) => {
+    if (e.key === 'ArrowLeft')  leftPressed  = false;
+    if (e.key === 'ArrowRight') rightPressed = false;
+    if (e.key === 'ArrowUp')    upPressed    = false;
+    if (e.key === 'ArrowDown')  downPressed  = false;
+  });
+
+  function handleSpacePress() {
+    if (ghostSnake) {
+      explodeGhostSnake();
+      ghostSnake = null;
+    } else {
+      spawnGhostSnake();
+    }
+  }
+
+  function spawnGhostSnake() {
+    const gsSegments = [];
+    for (let i = 0; i < segmentCount; i++) {
+      const segPos = getSegmentPos(i);
+      gsSegments.push({ x: segPos.x, y: segPos.y });
+    }
+    ghostSnake = {
+      segments: gsSegments,
+      count: segmentCount
+    };
+  }
+
+  function explodeGhostSnake() {
+    if (!ghostSnake) return;
+    for (let i = 0; i < ghostSnake.count; i++) {
+      const segPos = ghostSnake.segments[i];
+      spawnGhostExplosion(segPos);
+    }
+  }
+
+  function spawnGhostExplosion(pos) {
+    if (!pos) return;
+    const explosion = {
+      x: pos.x,
+      y: pos.y,
+      startTime: performance.now()/1000,
+      particles: []
+    };
+    for (let i = 0; i < 50; i++) {
+      const angle = Math.random() * 2 * Math.PI;
+      const speed = Math.random() * 2 + 1;
+      const vx = Math.cos(angle)*speed;
+      const vy = Math.sin(angle)*speed;
+      const gray = Math.floor(80 + Math.random() * 175);
+      const color = `rgb(${gray},${gray},${gray})`;
+      explosion.particles.push({ x: 0, y: 0, vx, vy, color });
+    }
+    explosions.push(explosion);
+  }
+
+
+  // ----------------------------
+  // ENEMY SPAWNING
+  // ----------------------------
+  const enemySquares   = [];
+  const enemyTriangles = [];
+  const enemySquareSpeed   = baseSpeed * 0.4;
+  const enemyTriangleSpeed = enemySquareSpeed;
+  const spawnIntervalSquare = 300; // frames
+  const spawnIntervalTri    = 400;
+  let   spawnTimerSquare    = 0;
+  let   spawnTimerTri       = 0;
+
+  // ----------------------------
+  // GRAVITY TOWARD CENTER
+  // ----------------------------
+  // Increase G so it's actually noticeable
+  let G = 10;  
+
+  // ----------------------------
+  // MAIN LOOP
+  // ----------------------------
+  function gameLoop() {
+    const now = performance.now();
+    const dt = (now - lastTime) / 1000;
+    lastTime = now;
+
+    update(dt);
+    render();
+    requestAnimationFrame(gameLoop);
+  }
+  requestAnimationFrame(gameLoop);
+
+  // ----------------------------
+  // UPDATE
+  // ----------------------------
+  function update(dt) {
+    // 1) Turn speed based on length
+    const lengthRatio = Math.max(0.5, Math.min(2.0, 22 / segmentCount));
+    const turnSpeed   = baseTurnSpeed * lengthRatio;
+
+    // 2) Turn left/right
+    if (leftPressed)  snake.angle -= turnSpeed;
+    if (rightPressed) snake.angle += turnSpeed;
+
+    // 3) Decide speed & color
+    let currentSpeed = baseSpeed;
+    snakeColor = '#0c4010'; // default
+
+    // “Back” segment = index = segmentCount-1
+    if (upPressed && segmentCount > 0) {
+      const backIndex = segmentCount - 1;
+      if (segmentStaminas[backIndex] > 0) {
+        currentSpeed *= boostMultiplier;
+        snakeColor = '#00ff00'; // bright green
+        // drain from the back
+        let s = segmentStaminas[backIndex];
+        s -= STAMINA_DRAIN_PER_SEC * dt;
+        if (s <= 0) {
+          // explode that segment
+          spawnExplosionForSegment(getSegmentPos(backIndex));
+          removeBackSegment();
+        } else {
+          segmentStaminas[backIndex] = s;
+        }
+      }
+    }
+
+    // “Front” segment = index = 0
+    if (downPressed && segmentCount > 0) {
+      currentSpeed *= slowMultiplier;
+      snakeColor = '#495b0c'; // yellowish green
+      // drain from the front
+      if (segmentStaminas[0] > 0) {
+        let s = segmentStaminas[0];
+        s -= STAMINA_DRAIN_PER_SEC * dt;
+        if (s <= 0) {
+          spawnExplosionForSegment(getSegmentPos(0));
+          removeFrontSegment();
+        } else {
+          segmentStaminas[0] = s;
+        }
+      }
+    }
+
+    // 4) Recharge the rest
+    rechargeStamina(dt);
+
+    // 5) Move snake
+    let vx = Math.sin(snake.angle) * currentSpeed;
+    let vy = -Math.cos(snake.angle) * currentSpeed;
+    snake.x += vx;
+    snake.y += vy;
+
+    // 6) Boundaries
+    if (snake.x < 0) {
+      snake.x = 0; vx = -vx;
+    } else if (snake.x > mapWidth) {
+      snake.x = mapWidth; vx = -vx;
+    }
+    if (snake.y < 0) {
+      snake.y = 0; vy = -vy;
+    } else if (snake.y > mapHeight) {
+      snake.y = mapHeight; vy = -vy;
+    }
+    if (vx !== Math.sin(snake.angle)*currentSpeed ||
+        vy !== -Math.cos(snake.angle)*currentSpeed) {
+      snake.angle = Math.atan2(vx, -vy);
+      snake.x += vx*2;
+      snake.y += vy*2;
+    }
+
+    // 7) Record head position
+    path.push({ x: snake.x, y: snake.y });
+    if (path.length > maxPathLength) {
+      path.shift();
+    }
+
+    // 8) Pulse for center square
+    pulse += 0.02;
+
+    // 9) Spawn enemies
+    spawnTimerSquare++;
+    if (spawnTimerSquare >= spawnIntervalSquare) {
+      spawnTimerSquare = 0;
+      spawnEnemySquare();
+    }
+    spawnTimerTri++;
+    if (spawnTimerTri >= spawnIntervalTri) {
+      spawnTimerTri = 0;
+      spawnEnemyTriangle();
+    }
+
+    // 10) Update enemies with gravity
+    updateEnemies(enemySquares, 'square', dt);
+    updateEnemies(enemyTriangles, 'triangle', dt);
+
+    // 11) Explosions
+    updateExplosions(dt);
+  }
+
+  // ----------------------------
+  // STAMINA & SEGMENT MGMT
+  // ----------------------------
+  function removeBackSegment() {
+    if (segmentCount > 0) {
+      segmentCount--;
+      segmentStaminas.pop();
+    }
+  }
+  function removeFrontSegment() {
+    if (segmentCount > 0) {
+      segmentCount--;
+      segmentStaminas.shift();
+    }
+  }
+  function rechargeStamina(dt) {
+    // Everything recharges by default
+    for (let i = 0; i < segmentCount; i++) {
+      let s = segmentStaminas[i];
+      s += STAMINA_RECHARGE_PER_SEC * dt;
+      if (s > 1) s = 1;
+      segmentStaminas[i] = s;
+    }
+  }
+
+  /**
+   * Get the (x,y) of a particular segment index in [0..segmentCount-1].
+   *  - 0 => front (the oldest segment in the path)
+   *  - segmentCount-1 => back (the newest segment, just behind the head)
+   *
+   * Because the head is the *newest* position in `path[path.length-1]`,
+   * and each segment is spaced by `segmentSpacing`.
+   *
+   * frontSegment => pathIndex = headIndex - (segmentCount-1)*segmentSpacing
+   * backSegment  => pathIndex = headIndex - 1*segmentSpacing
+   * more generally => pathIndex = headIndex - (segmentCount-1 - segIndex)*segmentSpacing
+   */
+  function getSegmentPos(segIndex) {
+    if (segIndex < 0 || segIndex >= segmentCount) {
+      // fallback, return head
+      return { x: snake.x, y: snake.y };
+    }
+    const headIndex = path.length - 1;
+    // # of steps from the head = (segmentCount-1 - segIndex)
+    const steps = (segmentCount - 1 - segIndex) * segmentSpacing;
+    const pathIndex = headIndex - steps;
+    if (pathIndex < 0) {
+      // fallback
+      return path[0] || { x: snake.x, y: snake.y };
+    }
+    return path[pathIndex];
+  }
+
+  // ----------------------------
+  // ENEMIES + GRAVITY
+  // ----------------------------
+  function updateEnemies(enemies, type, dt) {
+  for (let i = enemies.length - 1; i >= 0; i--) {
+    const obj = enemies[i];
+
+    // Gravity toward center
+    const dx = centerX - obj.x;
+    const dy = centerY - obj.y;
+    const dist2 = dx * dx + dy * dy;
+    if (dist2 > 0) {
+      // Calculate gravitational force magnitude
+      const force = G * obj.size / (dist2 - 50);
+      // Compute acceleration components along the direction to the center
+      const ax = force * dx;
+      const ay = force * dy;
+      // Update velocity with consideration of delta time
+      obj.vx += ax * dt;
+      obj.vy += ay * dt;
+    }
+
+    // Move enemy according to its velocity and delta time
+
+    let damping = 1 - (1 / (dist2 * dist2)) * 10;
+    if (damping < 0.99) damping = 0.99;
+    obj.vx *= damping;
+    obj.vy *= damping;
+    obj.x += obj.vx;
+    obj.y += obj.vy;
+
+    // Bounce off snake “middle line” (no thickness)
+    bounceObjectOffSnake(obj);
+    bounceObjectOffGhost(obj);
+    // Collide with center => score
+    if (checkCollisionWithCenter(obj.size, obj.x, obj.y)) {
+      if (type === 'square')   score++;
+      if (type === 'triangle') score--;
+      enemies.splice(i, 1);
+      continue;
+    }
+
+    // Remove if far out of bounds
+    if (obj.x < -200 || obj.x > mapWidth + 200 ||
+        obj.y < -200 || obj.y > mapHeight + 200) {
+      enemies.splice(i, 1);
+    }
+  }
+}
+
+  function spawnEnemySquare() {
+    const angle = Math.random()*Math.PI*2;
+    const maxDim = Math.max(mapWidth, mapHeight);
+    const spawnR = maxDim/2 + 200;
+    const sx = centerX + spawnR*Math.cos(angle);
+    const sy = centerY + spawnR*Math.sin(angle);
+
+    // pick a random target in a circle
+    const viewRadius = canvas.width;
+    const txAngle = Math.random()*Math.PI*2;
+    const tx = centerX + viewRadius*Math.cos(txAngle);
+    const ty = centerY + viewRadius*Math.sin(txAngle);
+
+    const dx = tx - sx, dy = ty - sy;
+    const dist = Math.hypot(dx, dy);
+    const vx = (dx/dist)*enemySquareSpeed;
+    const vy = (dy/dist)*enemySquareSpeed;
+
+    const size = Math.random()*30 + 10;
+    enemySquares.push({ x:sx, y:sy, vx, vy, size });
+  }
+
+  function spawnEnemyTriangle() {
+    const angle = Math.random()*Math.PI*2;
+    const maxDim = Math.max(mapWidth, mapHeight);
+    const spawnR = maxDim/2 + 200;
+    const sx = centerX + spawnR*Math.cos(angle);
+    const sy = centerY + spawnR*Math.sin(angle);
+
+    // ~80% circle
+    const viewRadius = canvas.width*0.8;
+    const txAngle = Math.random()*Math.PI*2;
+    const tx = centerX + viewRadius*Math.cos(txAngle);
+    const ty = centerY + viewRadius*Math.sin(txAngle);
+
+    const dx = tx - sx, dy = ty - sy;
+    const dist = Math.hypot(dx, dy);
+    const vx = (dx/dist)*enemyTriangleSpeed;
+    const vy = (dy/dist)*enemyTriangleSpeed;
+
+    const baseSize = Math.random()*30 + 10;
+    const size = baseSize*0.7;
+
+    enemyTriangles.push({ x:sx, y:sy, vx, vy, size });
+  }
+
+  // ----------------------------
+  // BOUNCE OFF SNAKE MIDDLE LINE
+  // ----------------------------
+  function bounceObjectOffSnake(obj) {
+    if (segmentCount < 2) return;
+    const headIndex = path.length - 1;
+    const enemyRadius = obj.size/2;
+
+    // We have segmentCount segments => segmentCount-1 lines
+    for (let i = 0; i < segmentCount-1; i++) {
+      // segment i => from getSegmentPos(i) to getSegmentPos(i+1)
+      const pA = getSegmentPos(i);
+      const pB = getSegmentPos(i+1);
+
+      // distance from obj => line pA->pB
+      const dist = pointSegmentDistance(obj.x, obj.y, pA.x, pA.y, pB.x, pB.y);
+      if (dist < enemyRadius) {
+        // reflect
+        reflectVelocity(obj, pA, pB);
+        obj.vx *= 1.02;
+        obj.vy *= 1.02;
+        // push out
+        const normal = getSegmentNormal(obj.x, obj.y, pA.x, pA.y, pB.x, pB.y);
+        const overlap = enemyRadius - dist;
+        obj.x += normal.nx*overlap;
+        obj.y += normal.ny*overlap;
+      }
+    }
+  }
+  function bounceObjectOffGhost(obj) {
+    if (!ghostSnake) return;
+    if (ghostSnake.count < 2) return;
+    const enemyRadius = obj.size / 2;
+    for (let i = 0; i < ghostSnake.count - 1; i++) {
+      const pA = ghostSnake.segments[i];
+      const pB = ghostSnake.segments[i+1];
+      const dist = pointSegmentDistance(obj.x, obj.y, pA.x, pA.y, pB.x, pB.y);
+      if (dist < enemyRadius) {
+        reflectVelocity(obj, pA, pB);
+        const normal = getSegmentNormal(obj.x, obj.y, pA.x, pA.y, pB.x, pB.y);
+        const overlap = enemyRadius - dist;
+        obj.x += normal.nx * overlap;
+        obj.y += normal.ny * overlap;
+      }
+    }
+  }
+
+
+  function pointSegmentDistance(px, py, x1, y1, x2, y2) {
+    const dx = x2 - x1, dy = y2 - y1;
+    if (dx===0 && dy===0) {
+      return Math.hypot(px - x1, py - y1);
+    }
+    const t = ((px - x1)*dx + (py - y1)*dy)/(dx*dx + dy*dy);
+    if (t<0) {
+      return Math.hypot(px - x1, py - y1);
+    } else if (t>1) {
+      return Math.hypot(px - x2, py - y2);
+    }
+    const projx = x1 + t*dx, projy = y1 + t*dy;
+    return Math.hypot(px - projx, py - projy);
+  }
+
+  function reflectVelocity(obj, pA, pB) {
+    const normalData = getSegmentNormal(obj.x, obj.y, pA.x, pA.y, pB.x, pB.y);
+    const nx = normalData.nx, ny = normalData.ny;
+    const dot = obj.vx*nx + obj.vy*ny;
+    obj.vx -= 2*dot*nx;
+    obj.vy -= 2*dot*ny;
+  }
+
+  function getSegmentNormal(px, py, x1, y1, x2, y2) {
+    const dx = x2 - x1, dy = y2 - y1;
+    let t = ((px - x1)*dx + (py - y1)*dy)/(dx*dx + dy*dy);
+    if (t<0) t=0; else if (t>1) t=1;
+    const projx = x1 + t*dx, projy = y1 + t*dy;
+    let nx = px - projx, ny = py - projy;
+    const len = Math.hypot(nx, ny);
+    if (len===0) {
+      // fallback
+      const segLen = Math.hypot(dx, dy);
+      nx = dy/segLen;
+      ny = -dx/segLen;
+    } else {
+      nx/=len; ny/=len;
+    }
+    return { nx, ny };
+  }
+
+  // ----------------------------
+  // CENTER COLLISION
+  // ----------------------------
+  function checkCollisionWithCenter(size, ox, oy) {
+    const half = baseSquareSize/2;
+    const left   = centerX - half;
+    const right  = centerX + half;
+    const top    = centerY - half;
+    const bottom = centerY + half;
+    return (
+      (ox + size/2) > left   &&
+      (ox - size/2) < right  &&
+      (oy + size/2) > top    &&
+      (oy - size/2) < bottom
+    );
+  }
+
+  // ----------------------------
+  // EXPLOSIONS
+  // ----------------------------
+  function spawnExplosionForSegment(pos) {
+    if (!pos) return;
+    const explosion = {
+      x: pos.x,
+      y: pos.y,
+      startTime: performance.now()/1000,
+      particles: []
+    };
+    // 50 particles
+    for (let i = 0; i < 50; i++) {
+      const angle = Math.random()*Math.PI*2;
+      const speed = Math.random()*2 + 1;
+      const vx = Math.cos(angle)*speed;
+      const vy = Math.sin(angle)*speed;
+      const g = Math.floor(100 + Math.random()*155); // random green
+      const color = `rgb(0,${g},0)`;
+      explosion.particles.push({ x:0, y:0, vx, vy, color });
+    }
+    explosions.push(explosion);
+  }
+
+  function updateExplosions(dt) {
+    const nowSec = performance.now()/1000;
+    for (let i=explosions.length-1; i>=0; i--) {
+      const ex = explosions[i];
+      const age = nowSec - ex.startTime;
+      if (age>EXPLOSION_DURATION) {
+        explosions.splice(i,1);
+        continue;
+      }
+      ex.particles.forEach(p => {
+        p.x += p.vx;
+        p.y += p.vy;
+      });
+    }
+  }
+
+  // ----------------------------
+  // RENDER
+  // ----------------------------
+  function render() {
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+
+    // Camera
+    ctx.save();
+    ctx.translate(canvas.width/2, canvas.height/2);
+    ctx.translate(-snake.x, -snake.y);
+
+    drawGrid();
+    drawCenterSquareAndScore();
+    drawPlayableBorders();
+    drawExplosions();
+    drawEnemySquares();
+    drawEnemyTriangles();
+    drawGhostSnake();
+    drawSnake();
+
+    ctx.restore();
+
+    drawDirectionIndicator();
+  }
+
+  function drawGrid() {
+    ctx.strokeStyle = '#ddd';
+    ctx.lineWidth = 1;
+    for (let x=0; x<=mapWidth; x+=100) {
+      ctx.beginPath();
+      ctx.moveTo(x,0);
+      ctx.lineTo(x,mapHeight);
+      ctx.stroke();
+    }
+    for (let y=0; y<=mapHeight; y+=100) {
+      ctx.beginPath();
+      ctx.moveTo(0,y);
+      ctx.lineTo(mapWidth,y);
+      ctx.stroke();
+    }
+  }
+
+  function drawPlayableBorders() {
+    ctx.save();
+    ctx.strokeStyle = 'black';
+    ctx.lineWidth = 6;
+    ctx.strokeRect(0,0,mapWidth,mapHeight);
+    ctx.restore();
+  }
+
+  function drawCenterSquareAndScore() {
+    // red square
+    ctx.fillStyle = 'darkred';
+    ctx.fillRect(
+      centerX - baseSquareSize/2,
+      centerY - baseSquareSize/2,
+      baseSquareSize, baseSquareSize
+    );
+    // glow
+    for (let i=0; i<6; i++) {
+      const waveSize = baseSquareSize + i*25 + Math.sin(pulse+i)*5;
+      const alpha = 0.3 - i*0.04;
+      if (alpha<=0) break;
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      ctx.strokeStyle = 'darkred';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(
+        centerX - waveSize/2,
+        centerY - waveSize/2,
+        waveSize,waveSize
+      );
+      ctx.restore();
+    }
+    // score
+    ctx.save();
+    ctx.fillStyle = 'white';
+    ctx.font = 'bold 24px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(score.toString(), centerX, centerY);
+    ctx.restore();
+  }
+
+  function drawEnemySquares() {
+    enemySquares.forEach(sq => {
+      const angle = Math.atan2(sq.vy, sq.vx);
+      ctx.save();
+      ctx.translate(sq.x, sq.y);
+      ctx.rotate(angle);
+      ctx.fillStyle = 'darkgreen';
+      ctx.fillRect(-sq.size/2, -sq.size/2, sq.size, sq.size);
+      ctx.restore();
+    });
+  }
+
+  function drawEnemyTriangles() {
+    enemyTriangles.forEach(tr => {
+      const angle = Math.atan2(tr.vy, tr.vx);
+      ctx.save();
+      ctx.translate(tr.x, tr.y);
+      ctx.rotate(angle);
+      ctx.fillStyle = 'darkred';
+      ctx.beginPath();
+      const half = tr.size/2;
+      ctx.moveTo( half,0 );
+      ctx.lineTo(-half, half);
+      ctx.lineTo(-half,-half);
+      ctx.closePath();
+      ctx.fill();
+      ctx.restore();
+    });
+  }
+  function drawGhostSnake() {
+    if (!ghostSnake) return;
+    const segs = ghostSnake.segments;
+    ctx.save();
+    ctx.fillStyle = ghostColor;
+    for (let i = 0; i < ghostSnake.count; i++) {
+      const p = segs[i];
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 10, 0, Math.PI*2);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  function drawSnake() {
+    // Each segment is a color interpolation from snakeColor (at stamina=1) => black (at stamina=0)
+    const headIndex = path.length - 1;
+    for (let i=0; i<segmentCount; i++) {
+      const pathIndex = headIndex - (segmentSpacing*(segmentCount-1 - i));
+      if (pathIndex<0) break;
+      const pos = path[pathIndex];
+      const st = segmentStaminas[i] ?? 1;
+      const c = hexToRGB(snakeColor);
+      // fade to black
+      const r = c.r*st;
+      const g = c.g*st;
+      const b = c.b*st;
+      const color = `rgb(${r},${g},${b})`;
+
+      ctx.save();
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.arc(pos.x, pos.y, 10, 0, Math.PI*2);
+      ctx.fill();
+      ctx.restore();
+    }
+  }
+
+  function hexToRGB(hex) {
+    hex = hex.replace(/^#/, '');
+    let r, g, b;
+    if (hex.length===3) {
+      r = parseInt(hex[0]+hex[0],16);
+      g = parseInt(hex[1]+hex[1],16);
+      b = parseInt(hex[2]+hex[2],16);
+    } else {
+      r = parseInt(hex.substring(0,2),16);
+      g = parseInt(hex.substring(2,4),16);
+      b = parseInt(hex.substring(4,6),16);
+    }
+    return {r, g, b};
+  }
+
+  function drawExplosions() {
+    const nowSec = performance.now()/1000;
+    explosions.forEach(ex => {
+      const age = nowSec - ex.startTime;
+      const t = age/EXPLOSION_DURATION;
+      const alpha = Math.max(0,1 - t);
+      ctx.save();
+      ctx.translate(ex.x, ex.y);
+      ex.particles.forEach(p => {
+        ctx.save();
+        ctx.globalAlpha = alpha;
+        ctx.fillStyle = p.color;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 3, 0, Math.PI*2);
+        ctx.fill();
+        ctx.restore();
+      });
+      ctx.restore();
+    });
+  }
+
+  function drawDirectionIndicator() {
+    // arrow = YELLOW
+    const relX = canvas.width/2 + (centerX - snake.x);
+    const relY = canvas.height/2 + (centerY - snake.y);
+    if (relX>0 && relX<canvas.width && relY>0 && relY<canvas.height) {
+      return; // center is visible
+    }
+    ctx.save();
+    const dx = relX - canvas.width/2;
+    const dy = relY - canvas.height/2;
+    const angle = Math.atan2(dy, dx);
+    const radius = Math.min(canvas.width, canvas.height)/2 - 20;
+    const indicatorX = canvas.width/2 + radius*Math.cos(angle);
+    const indicatorY = canvas.height/2 + radius*Math.sin(angle);
+    ctx.translate(indicatorX, indicatorY);
+    ctx.rotate(angle);
+    ctx.fillStyle = 'yellow';
+    ctx.beginPath();
+    ctx.moveTo(0,0);
+    ctx.lineTo(-10, 5);
+    ctx.lineTo(-10,-5);
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+  }
+})();
+</script>
+</body>
+</html>
